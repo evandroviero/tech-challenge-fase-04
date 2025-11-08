@@ -5,8 +5,11 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 from app.database import get_session
 from app.models import Ticker
-from app.schemas import TickerList, TickerPartialUpdate, TickerPublic, TickerSchema, PredictSchema
-
+from app.schemas import TickerList, TickerPartialUpdate, TickerPublic, TickerSchema, PredictSchema, TickerSchemaPut
+from src.data_ingestion import download_stock_data
+from datetime import datetime
+import os
+from src.predict import get_prediction
 
 router = APIRouter(
     prefix="/api/v1/tickers",
@@ -21,26 +24,55 @@ RENT_MODEL = "model/rent_model.pkl"
     summary="Create a new ticker",
     response_description="The created ticker",  
     status_code=status.HTTP_201_CREATED,
-    response_model=TickerPublic,
+    response_model=TickerSchema,
 )
 def create_ticker(ticker: TickerSchema, 
                  session: Session = Depends(get_session)):
 
-    existing_ticker = session.query(Ticker).filter(
-        Ticker.ticket == ticker.ticket,
-        Ticker.date == ticker.date
-    ).first()
-    if existing_ticker:
+    df = download_stock_data(ticker.ticket, ticker.date)
+    if df is None or df.empty:
         raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"Ticker '{ticker.ticket}' already exists for date '{ticker.date}'."
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Não foi possível obter dados para o ticker '{ticker.ticket}'."
         )
-    
-    ticker = Ticker(**ticker.model_dump())
-    session.add(ticker)
+
+    # 🔹 Busca todas as datas existentes de uma vez (evita queries dentro do loop)
+    existing_dates = {
+        t.date for t in session.query(Ticker.date)
+                            .filter(Ticker.ticket == ticker.ticket)
+                            .all()
+    }
+
+    tickers_to_insert = []
+
+    for _, row in df.iterrows():
+        row_date = datetime.strptime(row["date"], "%Y-%m-%d").date()
+
+        if row_date in existing_dates:
+            continue
+
+        ticker_data = Ticker(
+            ticket=ticker.ticket,
+            date=row_date,
+            open=row["open"],
+            high=row["high"],
+            low=row["low"],
+            close=row["close"],
+            volume=row["volume"],
+        )
+        tickers_to_insert.append(ticker_data)
+
+    if not tickers_to_insert:
+        existing_ticker = (
+            session.query(Ticker)
+            .filter(Ticker.ticket == ticker.ticket)
+            .order_by(Ticker.date.desc())
+            .first()
+        )
+        return existing_ticker
+    session.add_all(tickers_to_insert)
     session.commit()
-    session.refresh(ticker)
-    return ticker
+    return tickers_to_insert[-1]
 
 @router.get(
     path="register/",
@@ -77,13 +109,13 @@ def get_ticker(ticker_id: int, session: Session = Depends(get_session)):
     status_code=status.HTTP_201_CREATED,
 )
 def update_ticker(ticker_id: int, 
-                 ticker: TickerSchema, 
+                 ticker: TickerSchemaPut, 
                  session: Session = Depends(get_session)):
     query = session.get(Ticker, ticker_id)
     if not query:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, 
-            detail="House not found")
+            detail="Ticker not found")
     
     for field, value in ticker.model_dump().items():
         setattr(query, field, value)
@@ -107,7 +139,7 @@ def patch_ticker(ticker_id: int,
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, 
             detail="Ticker not found")
-    update_data = {k: v for k, v in house.model_dump(exclude_unset=True).items()}
+    update_data = {k: v for k, v in ticker.model_dump(exclude_unset=True).items()}
     for field, value in update_data.items():
         setattr(query, field, value)
     
@@ -137,11 +169,14 @@ def delete_ticker(ticker_id: int, session: Session = Depends(get_session)):
     status_code=status.HTTP_200_OK,
 )
 def predict_ticker(ticker: PredictSchema, session: Session = Depends(get_session)):
-    input_data = pd.DataFrame([ticker.model_dump()])
-    predicted_rent = float(RENT_MODEL.predict(input_data)[0])
-    ticker_db = Ticker(**ticker.model_dump(), rent_amount=predicted_rent)
+    return get_prediction(ticker.ticket, session)
+
+    # input_data = pd.DataFrame([ticker.model_dump()])
+    # predicted_rent = float(RENT_MODEL.predict(input_data)[0])
+    # ticker_db = Ticker(**ticker.model_dump(), rent_amount=predicted_rent)
     
-    session.add(ticker_db)
-    session.commit()
-    session.refresh(ticker_db)
-    return {"predicted_rent": predicted_rent}
+    # session.add(ticker_db)
+    # session.commit()
+    # session.refresh(ticker_db)
+    # return {"predicted_rent": predicted_rent}
+
